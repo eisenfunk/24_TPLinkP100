@@ -101,7 +101,7 @@ sub new {
 	};
 
 	bless $self, $class;
-	print STDERR "TapoDevice: Trying init() with $self->{_username} on $self->{_password}\n";
+	print STDERR "TapoDevice: Trying init() with $self->{_username} on $self->{_hostname}\n";
 	$self->init();
 	return $self;
 }
@@ -137,7 +137,7 @@ sub request ($$$) {
 
 	if (!$self->isAuth()) {
 		$self->init();
-		return FALSE if !$self->isAuth();
+		return undef if !$self->isAuth();
 	}
 	my $js = JSON->new->allow_nonref;
 	my $json = $js->utf8(1)->encode($data);
@@ -160,6 +160,7 @@ sub __authenticate($) {
 	my $response = __requestRaw($self, "handshake1", $self->{_localseed});
 
 	if ($response->{_rc} == 200) {
+		print STDERR "AUTH1\n";
 		$self->{_remoteseed} = substr($response->{_content},0,16);
 		$self->{_serverhash} = substr($response->{_content},16);
 
@@ -168,9 +169,7 @@ sub __authenticate($) {
 			if ($response->{_headers}->{"set-cookie"} =~ /^(.+);TIMEOUT=(\d+)$/) {
 				$self->{_cookie} = $1;
 				$self->{_ttl} = time() + $2;
-				print STDERR "TapoDevice: Authentification handshake1 finished\n";
 			} else {
-				print STDERR "TapoDevice: Authentification handshake1 failed\n";
 				return FALSE;
 			}
 		}
@@ -185,12 +184,9 @@ sub __authenticate($) {
 			$self->{_sig} = substr(sha256( "ldk" . $self->{_localseed} . $self->{_remoteseed} . $self->{_authhash} ), 0, 28);
 			$self->{_auth} = TRUE;
 			$self->__unpackSeq();
-			print STDERR "TapoDevice: Authentification handshake2 finished\n";
 			return TRUE;
 		}
-		print STDERR "TapoDevice: Authentification handshake2 failed\n";
 	}
-	print STDERR "TapoDevice: Authentification failed\n";
 	return FALSE;
 }
 
