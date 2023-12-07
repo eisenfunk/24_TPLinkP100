@@ -21,12 +21,16 @@ TP-link rolled out new firmware for their devices. Main reason was a massive sec
 Energy measurement is not inplemented after this change, so i will add this in the upcoming weeks.
 
 ## Bugs
-The module is well tested against Tapo P100, P110 and P115 power outlets. Currently just one major bug is known, that may not be caused by the modules code:
+The module is well tested against Tapo P100, P110 and P115 power outlets. Currently just two major bug are known, that may not be caused by the modules code:
 
+Version 0.3
 Powermanagement on P110 is working flawless UNTIL YOU UNPLUG THE POWER OUTLET.
 After a powerloss the device is returning **1003 MALFORMED JSON** errors and overall functionality is gone.
 The only way to fix this is resetting your device by rpessing the power button for longer than 5 seconds until the led blink yellow/green.
 After doing the setup again with the Tapo App the device is working again in fhem without restarting fhem or the module.
+
+Version 0.4 (New auth protocol)
+four of my five P100 suddenly sent me 403 forbidden when i tried to define the device. I was unable to use the devices until i changed my password in the tapo app. I've changed from my old password to the same, so no change at all. This did solve the problem.
 
 ## Thank you
 Many thanks to https://github.com/dswd/OctoPrint-PSUControl-Tapo . They did all the reverse engineering and research. I've just translated the python code into a fhem perl module :)
