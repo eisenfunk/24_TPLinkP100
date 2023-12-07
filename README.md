@@ -27,3 +27,6 @@ Powermanagement on P110 is working flawless UNTIL YOU UNPLUG THE POWER OUTLET.
 After a powerloss the device is returning **1003 MALFORMED JSON** errors and overall functionality is gone.
 The only way to fix this is resetting your device by rpessing the power button for longer than 5 seconds until the led blink yellow/green.
 After doing the setup again with the Tapo App the device is working again in fhem without restarting fhem or the module.
+
+## Thank you
+Many thanks to https://github.com/dswd/OctoPrint-PSUControl-Tapo . They did all the reverse engineering and research. I've just translated the python code into a fhem perl module :)
