@@ -285,6 +285,15 @@ sub switch_off ($) {
 	}
 }
 
+sub get_energy ($) {
+	my ($self) = @_;
+	my $response = $self->request("/request", {"method" => "get_energy_usage"} );
+	if ($response->{rc} == 200) {
+		return $response;
+	}
+	return FALSE;
+}
+
 sub get_info ($) {
 	my ($self) = @_;
 	my $response = $self->request("/request", {"method" => "get_device_info"} );
@@ -292,7 +301,6 @@ sub get_info ($) {
 		return $response;
 	}
 	return FALSE;
-
 }
 
 1;
@@ -520,6 +528,7 @@ sub TPLinkP100_Set($$@) {
 	}
 	if ($cmdList->{$cmd} eq "status") {
 		__getDeviceinfo($hash, $hash->{helper}->{TapoDevice}->get_info($hash));
+		__getDeviceinfo($hash, $hash->{helper}->{TapoDevice}->get_energy($hash));
 		return undef;
 	}
 
@@ -532,8 +541,9 @@ sub TPLinkP100_GetUpdate ($) {
 	
 	InternalTimer(gettimeofday()+$hash->{interval}, "TPLinkP100_GetUpdate", $hash);
 
+	my $reply = $hash->{helper}->{TapoDevice}->get_energy($hash);
+	__getDeviceinfo($hash, $reply);
 	my $reply = $hash->{helper}->{TapoDevice}->get_info($hash);
-print Dumper($reply,$hash);
 	__getDeviceinfo($hash, $reply);
 	return undef if ($reply->{rc} == 200);
 }
