@@ -14,6 +14,12 @@ e.g.
 login and password is your Tapo App registered login. The documentation is included in the module as usual in german/english. click
 on "Help for TPLinkP100" in FhemWeb.
 
+## New Tapo Device authentification
+
+TP-link rolled out new firmware for their devices. Main reason was a massive security leak in their authentification, which is completly changed.
+24_TPLinkP100 is supporting the new authentification only and dedicated since version 0.4. You have to use the initial uploaded version of this fhem module If you have placed your devices behind a firewall and block them from updates. I strongly recommend updating your firmware because a) i won't support the old authentification because it is b) unsecure.
+Energy measurement is not inplemented after this change, so i will add this in the upcoming weeks.
+
 ## Bugs
 The module is well tested against Tapo P100, P110 and P115 power outlets. Currently just one major bug is known, that may not be caused by the modules code:
 
