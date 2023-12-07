@@ -26,9 +26,13 @@
 ################################################################
 #
 # TODOs
-# store RSAKEY, TPKEY and TPIV
 # units for readings like mW, mA, dB ...
 # status symbol for not connected
+# energy measurement (after new authentification)
+#
+# Version 0.4
+# -- Removed old and unsecure authentification , please update the firmware of your device or install version 0.3
+# -- Added new authentification
 #
 # Version 0.3
 # -- introduced attr disablePowermeasurement for model P110 with default 1
@@ -52,7 +56,7 @@
 # -- reading update on changed values
 # -- basic switch functionality (on/off)
 #
-# Tested on:
+# Tested verion 0.3 on:
 # P115
 # 	hw_ver 1.0
 # 	fw_ver 1.1.6 Build 221114 Rel.203339
@@ -66,7 +70,236 @@
 # 	hw_ver 2.0
 # 	fw_ver 1.1.4 Build 221219 Rel.103556
 #
+# Tested version 0.4 on:
+# P115, P110, P100 with all newer firmware versions
 
+package TapoDevice;
+
+use strict;
+use warnings;
+use Encode;
+
+use Digest::SHA qw(sha1_hex sha1 sha256_hex sha256);
+use Data::Dumper;
+use Crypt::Random::Seed;
+use LWP;
+use Crypt::Mode::CBC;
+use JSON;
+use constant {
+	TRUE => 1,
+	FALSE => 0
+};
+
+sub new {
+	my $class = shift;
+	my $seed = new Crypt::Random::Seed;
+	my $self = {
+		_hostname => shift,
+		_username => shift,
+		_password => shift,
+		_localseed => $seed->random_bytes(16)
+	};
+
+	bless $self, $class;
+	print STDERR "TapoDevice: Trying init() with $self->{_username} on $self->{_password}\n";
+	$self->init();
+	return $self;
+}
+
+sub init ($) {
+	my ($self) = @_;
+
+	$self->{_authhash} = sha256( sha1($self->{_username}) . sha1($self->{_password}) );
+	$self->{_timeout} = 2;
+	$self->{_auth} = FALSE;
+	$self->{_ttl} = 0;
+
+	$self->__authenticate();
+
+	if ($self->{_auth} == TRUE) {
+		print STDERR "TapoDevice: Authenticated\n";
+	} else {
+		print STDERR "TapoDevice: Authentification failed\n";
+		return FALSE;
+	}
+	return $self;
+}
+
+sub isAuth ($) {
+	my ($self) = @_;
+
+	$self->init() if time() > $self->{_ttl};
+	return $self->{_auth};
+}
+
+sub request ($$$) {
+	my ($self, $path, $data) = @_;
+
+	if (!$self->isAuth()) {
+		$self->init();
+		return FALSE if !$self->isAuth();
+	}
+	my $js = JSON->new->allow_nonref;
+	my $json = $js->utf8(1)->encode($data);
+	my $sendPck = $self->__encrypt($json);
+	my $response = __requestRaw($self, "request", $sendPck, $self->{_cookie});
+
+        if ($response->{_rc} == 200) {
+                $self->{reply} = $js->decode($self->__decrypt($response->{_content}));
+                $self->{reply}->{rc} = 200;
+        } else {
+                $self->{reply}->{rc} = $response->{_rc};
+        }
+
+        return $self->{reply};
+}
+
+sub __authenticate($) {
+	my ($self) = @_;
+
+	my $response = __requestRaw($self, "handshake1", $self->{_localseed});
+
+	if ($response->{_rc} == 200) {
+		$self->{_remoteseed} = substr($response->{_content},0,16);
+		$self->{_serverhash} = substr($response->{_content},16);
+
+		my $localseed_authhash = sha256( $self->{_localseed} . $self->{_remoteseed} . $self->{_authhash} );
+		if ($localseed_authhash eq $self->{_serverhash}) {
+			if ($response->{_headers}->{"set-cookie"} =~ /^(.+);TIMEOUT=(\d+)$/) {
+				$self->{_cookie} = $1;
+				$self->{_ttl} = time() + $2;
+				print STDERR "TapoDevice: Authentification handshake1 finished\n";
+			} else {
+				print STDERR "TapoDevice: Authentification handshake1 failed\n";
+				return FALSE;
+			}
+		}
+		$self->{_handshake2} = sha256( $self->{_remoteseed} . $self->{_localseed} . $self->{_authhash} );
+		
+		$response = __requestRaw($self, "handshake2", $self->{_handshake2}, $self->{_cookie} );
+
+		if ($response->{_rc} == 200) {
+			$self->{_key} = substr(sha256( "lsk" . $self->{_localseed} . $self->{_remoteseed} . $self->{_authhash} ), 0, 16);
+			$self->{_ivseq} = sha256("iv" . $self->{_localseed} . $self->{_remoteseed} . $self->{_authhash} );
+			$self->{_iv} = substr($self->{_ivseq}, 0, 12);
+			$self->{_sig} = substr(sha256( "ldk" . $self->{_localseed} . $self->{_remoteseed} . $self->{_authhash} ), 0, 28);
+			$self->{_auth} = TRUE;
+			$self->__unpackSeq();
+			print STDERR "TapoDevice: Authentification handshake2 finished\n";
+			return TRUE;
+		}
+		print STDERR "TapoDevice: Authentification handshake2 failed\n";
+	}
+	print STDERR "TapoDevice: Authentification failed\n";
+	return FALSE;
+}
+
+sub __unpackSeq ($) {
+	my ($self) = @_;
+	$self->{_seq} = unpack("l>", substr($self->{_ivseq}, -4, 4));
+	return TRUE;
+}
+
+sub __packSeq ($) {
+	my ($self) = @_;
+	$self->{_bseq} = pack("l>", $self->{_seq});
+	return TRUE;
+}
+
+sub __incrSeq ($) {
+	my ($self) = @_;
+	$self->{_seq}++;
+	$self->__packSeq();
+	return TRUE;
+}
+
+sub __requestRaw ($$$$) {
+	my ($self, $path, $data, $cookie) = @_;
+
+	$self->{ua} = new LWP::UserAgent if !defined $self->{ua};
+	$self->{ua}->timeout($self->{TIMEOUT});
+
+	my $getopt = "";
+	$getopt = "?seq=" .$self->{_seq} if $self->{_seq};
+
+	my $request = new HTTP::Request(
+		'POST',
+		"http://$self->{_hostname}/app/${path}${getopt}"
+	);
+	$request->header("Cookie" => $cookie) if $cookie;
+	$request->header("Connection" => "Keep-Alive");
+	$request->header("Accept" => "*/*");
+	$request->content($data);
+
+	my $response = $self->{ua}->request($request);
+
+	return $response;
+}
+
+sub __encrypt ($$) {
+	my ($self, $data) = @_;
+
+	$self->__incrSeq();
+
+	# padding data
+	my $padCnt = 16 - length($data) % 16;
+	$data .= " " x $padCnt;
+
+	my $enc = Crypt::Mode::CBC->new('AES');
+	my $enc_text = $enc->encrypt($data, $self->{_key}, $self->{_iv}.$self->{_bseq});
+	$self->{bsig} = sha256( $self->{_sig} . $self->{_bseq} . $enc_text );
+
+	return $self->{bsig}.$enc_text;
+}
+
+sub __decrypt ($$) {
+	my ($self, $data) = @_;
+
+	# Original python code does not check the incoming signature, but this is part of the security concept.
+	#if (substr($data,0,32) ne $self->{bsig}) {
+		#return FALSE;
+	#}
+	my $enc = Crypt::Mode::CBC->new('AES');
+	return $enc->decrypt(substr($data,32), $self->{_key}, $self->{_iv}.$self->{_bseq});
+}
+
+sub switch_on ($) {
+	my ($self) = @_;
+	my $response = $self->request("/request", {"method" => "set_device_info", "params" => {"device_on" => JSON::true}} );
+	if ($response->{rc} == 200) {
+		$self->get_info();
+		return $response;
+	} else {
+		return FALSE;
+	}
+}
+
+sub switch_off ($) {
+	my ($self) = @_;
+	my $response = $self->request("/request", {"method" => "set_device_info", "params" => {"device_on" => JSON::false}} );
+	if ($response->{rc} == 200) {
+		$self->get_info();
+		return $response;
+	} else {
+		return FALSE;
+	}
+}
+
+sub get_info ($) {
+	my ($self) = @_;
+	my $response = $self->request("/request", {"method" => "get_device_info"} );
+	if ($response->{rc} == 200) {
+		return $response;
+	}
+	return FALSE;
+
+}
+
+1;
+
+#
+# This part of the code includes the old authentication protocol, which will be deleted in the future.
+#
 package main;
 
 use strict;
@@ -76,6 +309,7 @@ use Digest::SHA qw(sha1_hex);
 use Crypt::CBC;
 use Crypt::Cipher::AES;   # Debian/Ubuntu: libcryptx-perl
 use Crypt::OpenSSL::RSA;
+use Digest::SHA qw(sha256_hex sha1_hex sha256 sha1);
 use JSON;
 use LWP;
 use MIME::Base64;
@@ -85,7 +319,7 @@ use constant {
 	FALSE => 0,
 };
 
-my $version = "0.3";
+my $version = "0.4";
 my $interval = 300;
 my $timeout = 5;
 
@@ -122,124 +356,8 @@ sub __readingsBulkUpper ($$) {
 	return $cnt;
 }
 
-sub __getToken ($) {
-	my ($hash) = @_;
-	Log (4, "$hash->{NAME} __getToken start sslHandshake");
-
-	return undef if (!defined $hash->{helper}->{TPKEY}) && !__sslHandshake($hash);	
-
-	Log (3,"$hash->{NAME} __getToken fetching new token");
-	my $raw = __sendEncrypted($hash, 'login_device', (
-			"username" => $hash->{helper}->{B64_USER},
-			"password" => $hash->{helper}->{B64_PASS},
-	));
-	my $json = $hash->{helper}->{JSON}->decode($raw) if defined $raw;
-	Log (5, "$hash->{NAME} __getToken received \$json = " . Dumper($json));
-
-	if (__hasError($hash, $json)) {
-		__unsetKeys($hash);
-		return undef;
-	} else {
-		__setToken($hash, $json->{result}->{token});
-		return $raw;
-	}
-}
-
-sub __hasError ($$) {
-	my ($hash, $json) = @_;
-	my $codes = {
-		0 => "OK",
-		404 => "DEVICE NOT REACHABLE",
-		500 => "INTERNAL ERROR BY FHEM MODULE",
-		1002 => "INCORRECT REQUEST",
-		1003 => "WRONG JSON FORMAT",
-		1008 => "VARIABLE TYPE ERROR",
-		1010 => "WRONG PUBLIC KEY LENGTH",
-		1012 => "INVALID TERMINAL UUID",
-		1015 => "INVALID REQUEST OR LOGIN",
-		9999 => "DEVICE NOT REACHABLE",
-	};
-	Log (4, "$hash->{NAME} __hasError started $json->{error_code}");
-
-	$json->{error_code} = 500 if (!defined $json->{error_code});
-	$json->{error_code} = abs($json->{error_code});
-
-	__readingsBulkUpper($hash, { "error_code" => $json->{error_code}, "error_msg" => $codes->{$json->{error_code}} });
-	return FALSE if $json->{error_code} == 0;
-
-	__unsetKeys($hash);
-	return TRUE;
-}
-
-sub __readToken ($) {
-	my ($hash) = @_;
-
-	return ReadingsVal($hash->{NAME}, "token", undef);
-}
-
-sub __hasToken ($) {
-	my ($hash) = @_;
-
-	return TRUE if (defined ReadingsVal($hash->{NAME}, "token", undef) && ReadingsVal($hash->{NAME}, "connected", "no") eq "yes");
-	return FALSE;
-}
-
-sub __unsetToken ($) {
-	my ($hash) = @_;
-
-	Log (4, "$hash->{NAME} __unsetToken");
-	__readingsBulkUpper($hash, {"connected" => "no", "token" => undef});
-	return TRUE;
-}
-
-sub __setToken ($$) {
-	my ($hash, $token) = @_;
-
-	Log (4, "$hash->{NAME} __setToken");
-	__readingsBulkUpper($hash, {"connected" => "yes", "token" => $token});
-	return TRUE if __readDeviceinfos($hash);
-	return FALSE;
-}
-
-sub __unsetKeys ($) {
-	my ($hash) = @_;
-
-	$hash->{helper}->{TPKEY} = undef;
-	$hash->{helper}->{TPIV} = undef;
-	$hash->{helper}->{COOKIE} = undef;
-	Log (4, "$hash->{NAME} __unsetKeys");
-	__readingsBulkUpper($hash, {"connected" => "no", "token" => undef});
-
-	return TRUE;
-}
-
-sub __setKeys ($$) {
-	my ($hash, $key) = @_;
-
-	Log (4, "$hash->{NAME} __setKeys");
-	my $cryptkey = decode_base64($key);
-	my $tpkey = $hash->{helper}->{RSAKEY}->decrypt($cryptkey);
-	$hash->{helper}->{TPKEY} = substr($tpkey, 0, 16);
-	$hash->{helper}->{TPIV} = substr($tpkey, 16, 16);
-
-	return TRUE;
-}
-
-sub __readDeviceinfos($) {
-	my ($hash) =@_;
-
-	Log (4, "$hash->{NAME} __readDeviceinfo 'get_device_info'");
-	return undef if !__getDeviceinfo($hash, 'get_device_info');
-	if ($hash->{model} eq "P110" && 
-	    AttrVal($hash->{NAME}, "disablePowermeasurement", 1) == 0 &&
-	    $hash->{STATE} eq "on" ) {
-		Log (4, "$hash->{NAME} __readDeviceinfos 'get_energy_usage'");
-		return FALSE if !__getDeviceinfo($hash, 'get_energy_usage');
-	}
-}
-
 sub __getDeviceinfo ($$) {
-	my ($hash, $cmd) = @_;
+	my ($hash, $json) = @_;
 	my $readings;
 	my $internals = {
 		"device_id" => 1,
@@ -267,148 +385,28 @@ sub __getDeviceinfo ($$) {
 		"local_time" => 1,
 	};
 
-	return FALSE if !__hasToken($hash);
+	return undef if !$json;
 
-	Log(4, "$hash->{NAME} __getDeviceinfo ($cmd)");
-	my $enc_json = __sendEncrypted($hash, $cmd, ());
+	print STDERR "TapoDevice: Parsing JSON\n";
 
-	my $json = $hash->{helper}->{JSON}->decode($enc_json) if defined $enc_json;
-	Log(5, "DEBUG $hash->{NAME} __getDeviceinfo ($cmd) " . Dumper($json));
-	return FALSE if __hasError($hash, $json);
-
-	if ($cmd eq 'get_device_info') {
-		$json->{result}->{ssid} = decode_base64($json->{result}->{ssid});
-		$json->{result}->{nickname} = decode_base64($json->{result}->{nickname});
+	$json->{result}->{ssid} = decode_base64($json->{result}->{ssid});
+	$json->{result}->{nickname} = decode_base64($json->{result}->{nickname});
 	
-		if ($json->{result}->{device_on} == 1) {
-			$hash->{STATE} = "on";
-			$readings->{status} = "on";
-		} else {
-			$hash->{STATE} = "off";
-			$readings->{status} = "off";
-		}
+	if ($json->{result}->{device_on} == 1) {
+		$hash->{STATE} = "on";
+		$readings->{status} = "on";
+	} else {
+		$hash->{STATE} = "off";
+		$readings->{status} = "off";
 	}
 
 	foreach (keys(%{$json->{result}})) {
 		$hash->{$_} = $json->{result}->{$_} if (defined $internals->{$_});
 		$readings->{$_} = $json->{result}->{$_} if (!defined $internals->{$_} && !defined $ignore->{$_});
 	}
-	Log(5, "DEBUG $hash->{NAME} __getDeviceinfo ($cmd) calling __readingBulkUpper " . Dumper($readings));
 	__readingsBulkUpper($hash, $readings);
 
 	return TRUE;
-}
-
-sub __sslHandshake ($) {
-	my ($hash) = @_;
-
-	my $raw = __jsonPost($hash, __cmdToJSON($hash, "handshake", $hash->{helper}->{PUBKEY}));
-	my $json = $hash->{helper}->{JSON}->decode($raw) if defined $raw;
-	return FALSE if __hasError($hash, $json);
-
-	__setKeys($hash, $json->{result}->{key});
-	return TRUE;
-}
-
-sub __cmdToJSON ($$$) {
-	my ($hash, $cmd, $args) = @_;
-	return encode_json ({
-		"method" => $cmd,
-		"requestTimeMils" => 0,
-		"terminalUUID" => $hash->{FUUID},
-		"params" => $args
-	});
-	return undef;
-}
-
-sub __jsonPost($$) {
-	my ($hash, $json) = @_;
-
-	my $http = LWP::UserAgent->new("timeout" => $hash->{TIMEOUT});
-	my $url = $hash->{helper}->{URL};
-
-	$url .= '?token=' . __readToken($hash) if (__hasToken($hash));
-
-	my $request = HTTP::Request->new(POST => $url);
-	$request->header('content-type' => 'application/json');
-	$request->header('Cookie' => $hash->{helper}->{COOKIE}) if (defined $hash->{helper}->{COOKIE});
-	Log(4, "$hash->{NAME} __jsonPost $url");
-	Log(5, "DEBUG $hash->{NAME} __jsonPost COOKIE " . $hash->{helper}->{COOKIE}) if defined $hash->{helper}->{COOKIE};
-	$request->content($json);
-
-	Log(5, "DEBUG $hash->{NAME} __jsonPost HTTP::Request " . Dumper($request));
-
-	my $raw = $http->request($request);
-	if (!$raw->is_success) {
-		return '{"error_code" : 404, "result" : "undef"}';
-	}
-
-	if (!defined $hash->{helper}->{COOKIE}) {
-		my $cookie = $raw->header('Set-Cookie');
-		if ($cookie=~/(TP_SESSIONID=\w+)/) {
-			$hash->{helper}->{COOKIE} = $1;
-		}
-	}
-
-	return $raw->decoded_content;
-}
-
-sub __sendEncrypted ($$%) {
-	my ($hash, $cmd, %args) = @_;
-
-	return undef if !defined($hash->{helper}->{TPKEY});
-
-	my $cipher = Crypt::CBC->new(
-			-cipher => 'Cipher::AES',
-			-keysize => 128/8,
-			-header => 'none',
-			-literal_key => 1,
-			-key => $hash->{helper}->{TPKEY},
-			-iv => $hash->{helper}->{TPIV},
-	);
-	my $json_cmd = __cmdToJSON($hash, $cmd, \%args );
-	Log(5, "DEBUG $hash->{NAME} __sendEncrypted ENC " . Dumper($json_cmd));
-
-	my $enc = encode_base64($cipher->encrypt( $json_cmd ));
-	$enc =~ s/\n//g;
-	Log(5, "DEBUG $hash->{NAME} __sendEncrypted ENC $enc");
-
-	my $transfer_json = encode_json({
-			method => 'securePassthrough',
-			params => { 
-				request => $enc,
-			}
-	});
-	Log(5, "DEBUG $hash->{NAME} __sendEncrypted RTS " . Dumper($transfer_json));
-
-	my $raw = __jsonPost($hash, $transfer_json);
-	my $json = $hash->{helper}->{JSON}->decode($raw) if defined $raw;
-	return undef if __hasError($hash, $json);
-
-	return $cipher->decrypt(decode_base64($json->{result}->{response}));
-}
-
-sub __switch ($$) {
-	my ($hash, $cmd) = @_;
-
-	return undef if ($hash->{STATE} eq $cmd);
-
-	my $ret = __sendEncrypted($hash, 'set_device_info', ( "device_on" => $cmd eq "on" ? JSON::true : JSON::false ));
-	if (!defined $ret) {
-		return undef if (!__hasToken($hash) && !TPLinkP100_Connect ($hash));
-	}
-
-	$hash->{STATE} = $cmd;
-	__readingsBulkUpper($hash,{ "status" => $cmd });
-
-	return undef;
-}
-
-sub __startConditionFailed ($) {
-	my ($hash) = @_;
-
-	return TRUE if IsDisabled ($hash);	
-	return TRUE if !$init_done;
 }
 
 sub TPLinkP100_Initialize($) {
@@ -433,8 +431,6 @@ sub TPLinkP100_Define($$) {
 	my @a = split("[ \t][ \t]*", $def);
 	return "Wrong syntax: use define <name> TPLinkP100 <hostname/ip> username password interval timeout" if (int(@a) < 5);
 	
-	$hash->{helper}->{B64_USER} = encode_base64(sha1_hex($a[3]));
-	$hash->{helper}->{B64_PASS} = encode_base64($a[4]);
 	$hash->{password} = $a[4];
 	if (@a == 6) {
 		if ($a[5] < 15) {
@@ -452,28 +448,16 @@ sub TPLinkP100_Define($$) {
 	$hash->{interval} = $interval || $a[5];
 	$hash->{TIMEOUT} = $timeout || $a[6];
 	$hash->{version} = $version;
+	$hash->{helper}->{TapoDevice} = TapoDevice->new( $a[2], $a[3], $a[4] );
 
-	#$hash->{helper}->{RSAKEY} = getKeyValue("RSAKEY");
-	#if (!defined $hash->{helper}->{RSAKEY}) {
-		$hash->{helper}->{RSAKEY} = Crypt::OpenSSL::RSA->generate_key(1024);
-		$hash->{helper}->{RSAKEY}->use_pkcs1_padding();
-		#}
-		#setKeyValue("RSAKEY",$hash->{helper}->{RSAKEY});
-	print STDERR Dumper($hash->{helper}->{RSAKEY});
-	$hash->{helper}->{PUBKEY}->{key} = $hash->{helper}->{RSAKEY}->get_public_key_x509_string();
-	$hash->{helper}->{URL} = 'http://' . $a[2] . '/app';
-	$hash->{helper}->{COOKIE} = undef;
-
-
-	# perl JSON does croak on error if used as a function.
-	# Better way is to use an object an set allow_nonref
-	# to prevent this default croaking which does stop fhem.
-	$hash->{helper}->{JSON} = JSON->new->allow_nonref;
-
-	Log (3, "TPLinkP100: $hash->{NAME} defined.");
-	
-	TPLinkP100_GetUpdate ($hash);
-    return undef;
+	if ($hash->{helper}->{TapoDevice}->isAuth()) {
+		Log (3, "TPLinkP100: $hash->{NAME} defined.");
+	} else {
+		Log (3, "TPLinkP100: $hash->{NAME} unauthorized, host/ip, username and/or password is wrong");
+		return undef;
+	}
+	TPLinkP100_GetUpdate($hash);
+    	return undef;
 }
 
 sub TPLinkP100_Notify ($$) {
@@ -501,7 +485,7 @@ sub TPLinkP100_Attr ($$$$) {
 sub TPLinkP100_Undefine($$) {
 	my ($hash, $arg) = @_; 
 
-	__unsetKeys($hash);
+	$hash->{helper}->{TapoDevice} = "";
 	RemoveInternalTimer($hash);
 
 	return undef;
@@ -510,7 +494,7 @@ sub TPLinkP100_Undefine($$) {
 sub TPLinkP100_Get($$@) {
 	my ($hash, $name, $opt, @args) = @_;
 
-	return undef if __startConditionFailed($hash);
+	return undef if IsDisabled ($hash);
 	return "\"get $name\" needs at least one argument" unless(defined($opt));
 	return ReadingsVal ($hash->{NAME}, "status", "off") if ($opt eq "status");
 	return "unknown argument $opt choose one of status";
@@ -520,10 +504,25 @@ sub TPLinkP100_Set($$@) {
 	my ($hash, $name, $cmd, @args) = @_;
 	my $cmdList = { "on" => 1, "off" => 1 };
 
-	return undef if __startConditionFailed($hash);
+	return undef if IsDisabled ($hash);
 	return "\"set $name\" needs at least one argument" unless(defined($cmd));
-	return "unknown argument $cmd choose one of " . join(" ", keys(%{$cmdList})) if ($cmd eq "?");
-	return __switch($hash, $cmd) if (defined $cmdList->{$cmd});
+	#return "unknown argument $cmd choose one of " . join(" ", keys(%{$cmdList})) if ($cmd eq "?");
+
+	if ($cmd eq "on") {
+		$hash->{helper}->{TapoDevice}->switch_on($hash);
+		__getDeviceinfo($hash, $hash->{helper}->{TapoDevice}->get_info($hash));
+		return undef;
+	}
+	if ($cmd eq "off") {
+		$hash->{helper}->{TapoDevice}->switch_off($hash);
+		__getDeviceinfo($hash, $hash->{helper}->{TapoDevice}->get_info($hash));
+		return undef;
+	}
+	if ($cmdList->{$cmd} eq "status") {
+		__getDeviceinfo($hash, $hash->{helper}->{TapoDevice}->get_info($hash));
+		return undef;
+	}
+
 	return SetExtensions($hash, join(" ", keys(%{$cmdList})), $name, $cmd, @args);
 }
 
@@ -533,25 +532,23 @@ sub TPLinkP100_GetUpdate ($) {
 	
 	InternalTimer(gettimeofday()+$hash->{interval}, "TPLinkP100_GetUpdate", $hash);
 
-	return undef if ((ReadingsVal ($hash->{NAME}, "connected", "no") eq "no") && !TPLinkP100_Connect ($hash));
-	return undef if __readDeviceinfos($hash);
+	my $reply = $hash->{helper}->{TapoDevice}->get_info($hash);
+print Dumper($reply,$hash);
+	__getDeviceinfo($hash, $reply);
+	return undef if ($reply->{rc} == 200);
 }
 
 sub TPLinkP100_Connect ($) {
 	my ($hash) = @_;
 	return undef if IsDisabled ($hash); 
-
-	my $ret = __getToken($hash);
-
-	return undef;
+	my $reply = $hash->{helper}->{TapoDevice}->get_info($hash);
+	$hash->__getDeviceinfo($reply);
+	return undef if ($reply->{rc} == 200);
 }
 
 sub TPLinkP100_Disconnect ($) {
 	my ($hash) = @_;
 	return undef if IsDisabled ($hash); 
-
-	__unsetKeys($hash);
-
 	return undef;
 }
 
@@ -570,6 +567,8 @@ sub TPLinkP100_Disconnect ($) {
     Hardware feature on-till and off-till are not included in this module.
     SetExtensions is offering more grainful and better options, supported for all fhem devices, so there
     is no necessity to include this very basic hardware support.
+    Please note that TP-Link changed the authentification of all Tapo devices in 2023. The old authentification was unsecure
+    and is also removed from this module. Please use version 0.3 if you want to go on with your old device, but consider updating.
     <br><br>
     P110 power measurement is included and does work UNTIL YOU UNPLUG THE DEVICE.
     After being powerless the device is returning 1003 MALFORMED JSON errors. Due to this the power measurement is disabled per default.
@@ -666,6 +665,9 @@ sub TPLinkP100_Disconnect ($) {
     Getestet wurden P100, P110 und P115. UK Modelle wie P125 sollten auch funktionieren, sind aber nicht getestet.
     Hardware on-till und off-till Funktionen der Ger&auml;te sind nicht inplementiert.
     Fhem SetExtentions stellen dies skalierbarer und besser bereit.
+    TP-Link hat die Authentifizierung in 2023 grundlegend verbessert und per Firmwareupdate herausgegeben.
+    Die alte Authentifizierung war mangelhaft und ist ab Version 0.4 entfernt. Bitte verwende Version 0.3 f&uuml;r &auml;ltere Tapo Devices.
+    Ein Update der Firmware ist aber dringend anzuraten.
     <br><br>
     P110 Power Management ist unterst&uuml;tzt und funktioniert BIS DAS GER&Auml;T ABGESTECKT WIRD.
     Wurde das Ger&auml;t stromlos, liefert es 1003 MALFORMED JSON Fehler an fhem zur&uuml;ck.
